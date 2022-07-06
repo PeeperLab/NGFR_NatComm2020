@@ -1,0 +1,100 @@
+##### NGFR versus immune infiltration and immune scores
+
+### Download TCGA samples melanoma (SKCM)
+
+library("TCGAbiolinks")
+library(SummarizedExperiment)
+
+query <- GDCquery(project = "TCGA-SKCM",
+                  data.category = "Transcriptome Profiling",
+                  data.type="Gene Expression Quantification",
+                  workflow.type = "HTSeq - Counts")
+
+GDCdownload(query)
+data <- GDCprepare(query)
+
+## Check if all samples are melanoma tumors
+table(data@colData@listData$definition)
+
+
+# Make matrix with data
+Exp_data<-unlist(assays(data))
+ENSGID_Names<-gsub("HTSeq - Counts.","",row.names(Exp_data))
+row.names(Exp_data)<-ENSGID_Names
+
+
+### DESeq2
+## Normalize + calculate Z-score
+library(DESeq2)
+library(Biobase)
+
+groups<-matrix(data="NA", ncol=2, nrow=ncol(Exp_data))
+groups[,1]<-sample(c("yes","no"), ncol(Exp_data), replace=T)
+groups[,2]<-sample(c("yes","no"), ncol(Exp_data), replace=T)
+colnames(groups)<-c("random1", "random2")
+
+dds_TCGA <- DESeqDataSetFromMatrix(countData = Exp_data, colData=groups, ~  random1)
+dds_TCGA <- DESeq(dds_TCGA)
+vsd_TCGA <- varianceStabilizingTransformation(dds_TCGA, blind=TRUE)
+mat_TCGA <- assay(vsd_TCGA)
+z.mat_TCGA <- t(scale(t(mat_TCGA), scale=TRUE, center=TRUE))
+
+
+## Annotate the ENSEMBL gene IDs
+library(biomaRt)
+## Ensembl ID to genes and location
+
+EnsemblID_gene<-function(ensemblID){
+	cat("This version uses 'uswest.ensembl.org'", "\n")
+	ensembl <- useMart("ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl",
+						host="uswest.ensembl.org", path="/biomart/martservice")
+
+    out <- getBM(attributes = c("band","ensembl_gene_id", "hgnc_symbol",
+    							"chromosome_name",  "start_position", "end_position"),
+    filters = "ensembl_gene_id" , values = list(ensemblID), mart = ensembl)
+	return(out)
+}
+
+
+out<-EnsemblID_gene(rownames(z.mat_TCGA))
+out_matched<-out[match(rownames(z.mat_TCGA), out[,2]),] 
+
+
+## Identify NGFR counts
+NGFR_index<-which(out_matched[,3]=="NGFR")
+
+
+
+## MCP counter analysis 
+MCPcounter_data<-z.mat_TCGA
+row.names(MCPcounter_data)<-out_matched[,3]
+
+install.packages(c("devtools","curl")) ##Installs devtools and the MCPcounter dependancy 'curl'
+library(devtools)
+install_github("ebecht/MCPcounter",ref="master", subdir="Source")
+
+library(MCPcounter)
+MCP_counterEstimate<-MCPcounter.estimate(MCPcounter_data,featuresType="HUGO_symbols",genes=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/genes.txt"),sep="\t",stringsAsFactors=FALSE,header=TRUE,colClasses="character",check.names=FALSE))
+
+
+#### Test differences between quartiles NGFR expression (top vs bottom)
+
+QTLS<-quantile(z.mat_TCGA[NGFR_index,])
+Bottom25_index <- which(z.mat_TCGA[NGFR_index,]<QTLS[2])
+Top25_index <- which(z.mat_TCGA[NGFR_index,]>QTLS[4])
+
+## Plots
+
+pdf(file="MCPcounter_boxplots_top-bottom_25Perc_REDO.pdf", width=12, height=12)
+
+par(mfrow=c(1,2))
+
+i= which(row.names(MCP_counterEstimate)=="T cells")
+	TMP_pval<-t.test(MCP_counterEstimate[i,Top25_index], MCP_counterEstimate[i,Bottom25_index])
+	boxplot(MCP_counterEstimate[i,Top25_index], MCP_counterEstimate[i,Bottom25_index], main=paste("Pval",round(TMP_pval$p.value,3)), ylab=paste( row.names(MCP_counterEstimate)[i]), names = c("Top25%","Bottom25%"))
+
+i= which(row.names(MCP_counterEstimate)=="Cytotoxic lymphocytes")
+	TMP_pval<-t.test(MCP_counterEstimate[i,Top25_index], MCP_counterEstimate[i,Bottom25_index])
+	boxplot(MCP_counterEstimate[i,Top25_index], MCP_counterEstimate[i,Bottom25_index], main=paste("Pval",round(TMP_pval$p.value,3)), ylab=paste( row.names(MCP_counterEstimate)[i]), names = c("Top25%","Bottom25%"))
+
+dev.off()
